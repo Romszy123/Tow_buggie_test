@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+desktop.ini
+*.dxf~
+~$*
+*.tmp
+*.log
