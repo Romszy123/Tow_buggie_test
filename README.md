@@ -18,7 +18,7 @@ Each folder has its own README with the relevant behavior, pinout, wiring, depen
 
 ## Git Branches
 
-- `master`: initial project snapshot.
-- `feature/elrs-crsf-due`: Arduino Due CAN project with ELRS/CRSF receiver support and the reorganized project names.
+- `master`: current default project version, including the Due CAN/ELRS controller and reorganized project names.
+- `feature/elrs-crsf-due`: retained branch reference to the ELRS development work; it currently points to the same reorganization commit as `master`.
 
 Switching branches changes the files visible in this working folder. Git keeps the committed versions and branch history in the hidden `.git` directory.
