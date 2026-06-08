@@ -9,7 +9,7 @@ The project is currently a safe CAN/CRSF bring-up target:
 - `Serial1` sends simplified battery telemetry to the BRemote RX board.
 - `Serial2` decodes all 16 CRSF channels from the ELRS receiver.
 - The USB serial monitor prints raw and microsecond channel values for transmitter mapping.
-- VESC motor commands are disabled by default in `src/srxl2_due_can_router.ino`.
+- VESC motor commands are disabled by default in `src/tow_buggie_due_can_elrs.ino`.
 
 ## Build And Flash
 

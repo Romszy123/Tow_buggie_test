@@ -1,4 +1,4 @@
-# SRXL2 and BRemote Dual-VESC PWM Router
+# Spektrum and BRemote Dual-VESC PWM Router
 
 This is the Arduino IDE version of the current Arduino Mega dual-VESC router sketch.
 
