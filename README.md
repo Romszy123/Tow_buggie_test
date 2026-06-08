@@ -11,6 +11,8 @@ This folder contains the current Arduino Mega firmware for routing either a Spek
 
 The Mega projects contain the current working PWM router logic. The Due projects are separate and target the next CAN-based version with two VESCs on CAN0, the JK BMS on CAN1, and battery telemetry sent to the BRemote RX over UART.
 
+On the `feature/elrs-crsf-due` branch, the Due projects decode an ExpressLRS Nano receiver over CRSF on `Serial2`: receiver `TX` connects to Due `D17/RX2`, and receiver `RX` connects to Due `D16/TX2`.
+
 The PlatformIO projects are the easiest way to build and upload firmware directly from this workspace.
 
 ## Arduino Mega Pin Diagram

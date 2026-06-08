@@ -1,12 +1,14 @@
-# Tow Buggie Due CAN PlatformIO Project
+# Tow Buggie Due CAN + ELRS PlatformIO Project
 
-This PlatformIO project is the Arduino Due version of the tow buggie controller. It is separate from the existing Arduino Mega PWM router.
+This branch replaces the planned Spektrum SRXL2 input with an ExpressLRS receiver using the CRSF serial protocol.
 
-The project is currently a CAN/UART bring-up target:
+The project is currently a safe CAN/CRSF bring-up target:
 
 - `CAN0` reads and commands the two Flipsky/VESC controllers.
 - `CAN1` reads the JK BMS.
 - `Serial1` sends simplified battery telemetry to the BRemote RX board.
+- `Serial2` decodes all 16 CRSF channels from the ELRS receiver.
+- The USB serial monitor prints raw and microsecond channel values for transmitter mapping.
 - VESC motor commands are disabled by default in `src/srxl2_due_can_router.ino`.
 
 ## Build And Flash
@@ -45,6 +47,8 @@ The Due has CAN controllers, but it still needs external CAN transceivers. Use 3
 | BMS CAN TX | `D53` / `CAN1TX` | JK BMS CAN transceiver `TXD` |
 | BRemote telemetry TX | `D18` / `TX1` | BRemote RX `U1-0 RX` |
 | BRemote telemetry RX | `D19` / `RX1` | BRemote RX `U1-0 TX`, optional |
+| ELRS CRSF TX | `D16` / `TX2` | ELRS receiver `RX`, reserved for future telemetry |
+| ELRS CRSF RX | `D17` / `RX2` | ELRS receiver `TX`, required |
 | Ground | `GND` | Common logic ground |
 
 ### CAN Transceiver Wiring
@@ -67,30 +71,68 @@ The Due has CAN controllers, but it still needs external CAN transceivers. Use 3
 
 Use one `120 ohm` termination at each physical end of each CAN bus.
 
-### Reserved For Control Input Migration
+### ELRS Receiver Wiring
 
-These pins are reserved to keep the wiring close to the current Mega project, but they are not active in this first CAN bring-up sketch yet.
+The iFlight ExpressLRS Nano receiver uses full-duplex, non-inverted CRSF. Unlike Spektrum SRXL2, this uses a normal UART pair.
 
-| Planned function | Arduino Due pin | Notes |
-|---|---:|---|
-| Spektrum SRXL2 single-wire data | `D49` | Needs a SAM3X-compatible SRXL2 single-wire input layer |
-| BRemote PWM input 0 | `D21` | Planned fallback/control input |
-| BRemote PWM input 1 | `D20` | Planned fallback/control input |
+| ELRS Nano pad | Arduino Due connection | Required |
+|---|---|---|
+| `TX` | `D17` / `RX2` | Yes |
+| `RX` | `D16` / `TX2` | Optional until ELRS telemetry is implemented |
+| `5V` | Regulated `5V` supply | Yes |
+| `GND` | Due `GND` / common logic ground | Yes |
+
+The UART signals are crossed: receiver `TX` goes to Due `RX2`, and receiver `RX` goes to Due `TX2`.
+
+The Due uses `3.3 V` logic. The Nano receiver is normally powered from `5 V`, while its CRSF UART signals are 3.3 V logic. Confirm the exact receiver revision before connecting it.
+
+CRSF is configured at the normal ExpressLRS receiver rate:
+
+```cpp
+const uint32_t ELRS_BAUD = 420000;
+```
+
+The BRemote inputs remain reserved for the later source-selection stage:
+
+| Planned function | Arduino Due pin |
+|---|---:|
+| BRemote PWM input 0 | `D21` |
+| BRemote PWM input 1 | `D20` |
 
 ## Wiring Diagram
 
 ```text
-                         Arduino Due
-                      +----------------+
-Spektrum SRXL2  ----> | D49            |  TODO: SAM3X single-wire layer
-BRemote PWM 0   ----> | D21            |  TODO: migrate from Mega project
-BRemote PWM 1   ----> | D20            |  TODO: migrate from Mega project
-                      |                |
-CANRX/CANTX     ----> | CAN0           | --> 3.3 V CAN transceiver --> VESC 0 + VESC 1
-DAC0/D53        ----> | CAN1           | --> 3.3 V CAN transceiver --> JK BMS
-D18/D19         ----> | Serial1        | --> BRemote RX U1-0 UART
-                      +----------------+
+                              Arduino Due
+                           +----------------+
+ELRS Nano TX ------------> | D17 / RX2      |
+ELRS Nano RX <------------ | D16 / TX2      |  Future ELRS telemetry
+BRemote PWM 0 ------------> | D21            |  Reserved
+BRemote PWM 1 ------------> | D20            |  Reserved
+                           |                |
+CANRX/CANTX -------------- | CAN0           | --> 3.3 V CAN transceiver --> VESC 0 + VESC 1
+DAC0/D53 ----------------- | CAN1           | --> 3.3 V CAN transceiver --> JK BMS
+D18/D19 ------------------ | Serial1        | <--> BRemote RX U1-0 UART
+                           +----------------+
 ```
+
+## Identify The ELRS Channel Mapping
+
+The sketch decodes CRSF frame type `0x16`, containing 16 packed 11-bit channels. Open the serial monitor at `115200 baud` and move one transmitter control at a time.
+
+```text
+ELRS fresh LQ=100% SNR=8 map(thr/steer/src)=988/1500/988us frames=1234 crcErr=0
+CRSF channels: CH1=172/988us CH2=992/1500us ... CH16=992/1500us
+```
+
+Record the channels for throttle, steering, source selection, and any arm switch. Then update these one-based constants near the top of the sketch:
+
+```cpp
+const uint8_t ELRS_THROTTLE_CHANNEL = 1;
+const uint8_t ELRS_STEERING_CHANNEL = 2;
+const uint8_t ELRS_SOURCE_SELECT_CHANNEL = 5;
+```
+
+An ELRS control frame becomes stale after `250 ms`. Motor commands remain disabled, so receiver wiring and channel placement can be tested without driving either VESC.
 
 ## CAN Bus Setup
 
@@ -163,4 +205,4 @@ The BRemote RX firmware still needs a matching parser on its `U1-0` UART channel
 
 ## Safety Defaults
 
-`ENABLE_VESC_COMMANDS` is set to `false`. The first flash should only confirm CAN receive, serial output, and UART telemetry. Enable motor commands only after the Due SRXL2 input layer, BRemote fallback, CH5 selection, and failsafe behavior are implemented and tested.
+`ENABLE_VESC_COMMANDS` is set to `false`. The first flash should only confirm CRSF decoding, CAN receive, serial output, and BRemote UART telemetry. Enable motor commands only after ELRS channel mapping, BRemote fallback, source selection, steering mix, arming, and failsafe behavior are implemented and tested.

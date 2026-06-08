@@ -39,6 +39,22 @@ const uint32_t PRINT_PERIOD_MS = 500;
 const uint32_t BREMOTE_TELEMETRY_PERIOD_MS = 500;
 const uint32_t BMS_STALE_MS = 1500;
 const uint32_t VESC_STALE_MS = 1500;
+const uint32_t ELRS_BAUD = 420000;
+const uint32_t ELRS_STALE_MS = 250;
+
+// CRSF channel assignments are intentionally easy to change after the
+// transmitter mapping is identified from the serial monitor.
+const uint8_t ELRS_THROTTLE_CHANNEL = 1;
+const uint8_t ELRS_STEERING_CHANNEL = 2;
+const uint8_t ELRS_SOURCE_SELECT_CHANNEL = 5;
+
+const uint8_t CRSF_FRAMETYPE_LINK_STATISTICS = 0x14;
+const uint8_t CRSF_FRAMETYPE_RC_CHANNELS_PACKED = 0x16;
+const uint8_t CRSF_ADDRESS_FLIGHT_CONTROLLER = 0xC8;
+const uint8_t CRSF_MAX_FRAME_SIZE = 64;
+const uint8_t CRSF_CHANNEL_COUNT = 16;
+const uint16_t CRSF_CHANNEL_MIN = 172;
+const uint16_t CRSF_CHANNEL_MAX = 1811;
 
 struct VescStatus {
   bool seen = false;
@@ -67,13 +83,30 @@ struct BmsStatus {
   uint32_t faultBits = 0;
 };
 
+struct ElrsStatus {
+  bool seenChannels = false;
+  uint32_t lastChannelsMs = 0;
+  uint32_t validFrames = 0;
+  uint32_t crcErrors = 0;
+  uint16_t channelRaw[CRSF_CHANNEL_COUNT] = {0};
+  uint16_t channelUs[CRSF_CHANNEL_COUNT] = {0};
+  uint8_t uplinkLinkQuality = 0;
+  int8_t uplinkSnr = 0;
+  uint8_t activeAntenna = 0;
+};
+
 VescStatus vescLeft;
 VescStatus vescRight;
 BmsStatus bms;
+ElrsStatus elrs;
 
 uint32_t lastVescCommandMs = 0;
 uint32_t lastPrintMs = 0;
 uint32_t lastBremoteTelemetryMs = 0;
+
+uint8_t crsfFrame[CRSF_MAX_FRAME_SIZE] = {0};
+uint8_t crsfFrameIndex = 0;
+uint8_t crsfFrameLength = 0;
 
 static uint16_t readU16LE(const uint8_t *data) {
   return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
@@ -118,6 +151,114 @@ static uint16_t crc16Ccitt(const uint8_t *data, size_t len) {
     }
   }
   return crc;
+}
+
+static uint8_t crc8DvbS2(const uint8_t *data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0xD5) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+static uint16_t crsfRawToMicroseconds(uint16_t raw) {
+  raw = constrain(raw, CRSF_CHANNEL_MIN, CRSF_CHANNEL_MAX);
+  return (uint16_t)map(raw, CRSF_CHANNEL_MIN, CRSF_CHANNEL_MAX, 988, 2012);
+}
+
+static void decodeCrsfChannels(const uint8_t *payload) {
+  uint32_t bitBuffer = 0;
+  uint8_t bitsAvailable = 0;
+  uint8_t payloadIndex = 0;
+
+  for (uint8_t channel = 0; channel < CRSF_CHANNEL_COUNT; channel++) {
+    while (bitsAvailable < 11) {
+      bitBuffer |= (uint32_t)payload[payloadIndex++] << bitsAvailable;
+      bitsAvailable += 8;
+    }
+
+    uint16_t raw = bitBuffer & 0x07FF;
+    bitBuffer >>= 11;
+    bitsAvailable -= 11;
+    elrs.channelRaw[channel] = raw;
+    elrs.channelUs[channel] = crsfRawToMicroseconds(raw);
+  }
+
+  elrs.seenChannels = true;
+  elrs.lastChannelsMs = millis();
+}
+
+static void processCrsfFrame() {
+  const uint8_t type = crsfFrame[2];
+  const uint8_t payloadLength = crsfFrameLength - 2;
+  const uint8_t *payload = &crsfFrame[3];
+
+  if (type == CRSF_FRAMETYPE_RC_CHANNELS_PACKED && payloadLength == 22) {
+    decodeCrsfChannels(payload);
+  } else if (type == CRSF_FRAMETYPE_LINK_STATISTICS && payloadLength >= 10) {
+    elrs.uplinkLinkQuality = payload[2];
+    elrs.uplinkSnr = (int8_t)payload[3];
+    elrs.activeAntenna = payload[4];
+  }
+}
+
+static void consumeCrsfByte(uint8_t value) {
+  if (crsfFrameIndex == 0) {
+    if (value != CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+      return;
+    }
+    crsfFrame[crsfFrameIndex++] = value;
+    return;
+  }
+
+  if (crsfFrameIndex == 1) {
+    if (value < 2 || value > CRSF_MAX_FRAME_SIZE - 2) {
+      crsfFrameIndex = 0;
+      crsfFrameLength = 0;
+      return;
+    }
+    crsfFrameLength = value;
+    crsfFrame[crsfFrameIndex++] = value;
+    return;
+  }
+
+  crsfFrame[crsfFrameIndex++] = value;
+  const uint8_t totalFrameSize = crsfFrameLength + 2;
+  if (crsfFrameIndex < totalFrameSize) {
+    return;
+  }
+
+  const uint8_t receivedCrc = crsfFrame[totalFrameSize - 1];
+  const uint8_t calculatedCrc = crc8DvbS2(&crsfFrame[2], crsfFrameLength - 1);
+  if (receivedCrc == calculatedCrc) {
+    elrs.validFrames++;
+    processCrsfFrame();
+  } else {
+    elrs.crcErrors++;
+  }
+
+  crsfFrameIndex = 0;
+  crsfFrameLength = 0;
+}
+
+static void pollElrs() {
+  while (Serial2.available() > 0) {
+    consumeCrsfByte((uint8_t)Serial2.read());
+  }
+}
+
+static bool elrsFresh() {
+  return elrs.seenChannels && (millis() - elrs.lastChannelsMs <= ELRS_STALE_MS);
+}
+
+static uint16_t elrsChannelUs(uint8_t oneBasedChannel) {
+  if (oneBasedChannel < 1 || oneBasedChannel > CRSF_CHANNEL_COUNT) {
+    return 1500;
+  }
+  return elrs.channelUs[oneBasedChannel - 1];
 }
 
 static VescStatus *statusForVescId(uint8_t id) {
@@ -252,9 +393,9 @@ static void sendSafeVescCommands() {
     return;
   }
 
-  // TODO: Replace these zero commands with the migrated DXS/BRemote source
-  // selection, throttle mapping, and CH2 steering mix once the Due SRXL2 input
-  // layer is completed.
+  // Keep zero commands during receiver bring-up. Once channel assignments and
+  // failsafe behavior are verified, map ELRS throttle/steering and the BRemote
+  // fallback into these two relative-current commands.
   sendVescCurrentRel(VESC_LEFT_ID, 0.0f);
   sendVescCurrentRel(VESC_RIGHT_ID, 0.0f);
 }
@@ -279,6 +420,42 @@ static void printOneVesc(const char *label, const VescStatus &status) {
 }
 
 static void printStatus() {
+  Serial.print("ELRS ");
+  if (elrsFresh()) {
+    Serial.print("fresh LQ=");
+    Serial.print(elrs.uplinkLinkQuality);
+    Serial.print("% SNR=");
+    Serial.print(elrs.uplinkSnr);
+    Serial.print(" map(thr/steer/src)=");
+    Serial.print(elrsChannelUs(ELRS_THROTTLE_CHANNEL));
+    Serial.print("/");
+    Serial.print(elrsChannelUs(ELRS_STEERING_CHANNEL));
+    Serial.print("/");
+    Serial.print(elrsChannelUs(ELRS_SOURCE_SELECT_CHANNEL));
+    Serial.print("us");
+  } else {
+    Serial.print(elrs.seenChannels ? "stale" : "waiting");
+  }
+  Serial.print(" frames=");
+  Serial.print(elrs.validFrames);
+  Serial.print(" crcErr=");
+  Serial.print(elrs.crcErrors);
+  Serial.println();
+
+  if (elrs.seenChannels) {
+    Serial.print("CRSF channels:");
+    for (uint8_t channel = 0; channel < CRSF_CHANNEL_COUNT; channel++) {
+      Serial.print(" CH");
+      Serial.print(channel + 1);
+      Serial.print("=");
+      Serial.print(elrs.channelRaw[channel]);
+      Serial.print("/");
+      Serial.print(elrs.channelUs[channel]);
+      Serial.print("us");
+    }
+    Serial.println();
+  }
+
   Serial.print("BMS ");
   if (bmsFresh()) {
     Serial.print(bms.packVoltageV, 1);
@@ -304,6 +481,7 @@ static void printStatus() {
 void setup() {
   Serial.begin(115200);
   Serial1.begin(115200);  // Due D18 TX1 / D19 RX1 to BRemote U1-0 UART.
+  Serial2.begin(ELRS_BAUD);  // Due D16 TX2 / D17 RX2 to ELRS CRSF UART.
 
   while (!Serial && millis() < 3000) {
     delay(10);
@@ -312,14 +490,16 @@ void setup() {
   Can0.begin(VESC_CAN_BAUD);
   Can1.begin(JK_BMS_CAN_BAUD);
 
-  Serial.println("Tow Buggie Due CAN router bring-up.");
-  Serial.println("CAN0: VESC bus, CAN1: JK BMS bus, Serial1: BRemote telemetry.");
+  Serial.println("Tow Buggie Due CAN + ELRS CRSF bring-up.");
+  Serial.println("CAN0: VESC, CAN1: JK BMS, Serial1: BRemote, Serial2: ELRS CRSF.");
+  Serial.println("ELRS wiring: receiver TX -> D17/RX2, receiver RX -> D16/TX2.");
   Serial.println(ENABLE_VESC_COMMANDS ? "VESC commands enabled." : "VESC commands disabled for safe bring-up.");
 }
 
 void loop() {
   uint32_t now = millis();
   pollCan();
+  pollElrs();
 
   if (now - lastVescCommandMs >= VESC_COMMAND_PERIOD_MS) {
     lastVescCommandMs = now;

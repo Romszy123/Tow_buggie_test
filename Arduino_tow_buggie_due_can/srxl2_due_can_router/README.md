@@ -1,6 +1,6 @@
-# Arduino Due CAN Router
+# Arduino Due CAN + ELRS Router
 
-This is the Arduino IDE version of the new Due-based tow buggie controller.
+This is the Arduino IDE version of the Due CAN and ExpressLRS CRSF bring-up controller on the `feature/elrs-crsf-due` branch.
 
 It is separate from the working Arduino Mega PWM router. The first version is a safe bring-up sketch: it initializes both CAN buses, parses VESC and JK BMS frames, prints telemetry, and sends a small battery telemetry packet to the BRemote RX over UART. Motor CAN commands are disabled by default in the sketch.
 
@@ -23,6 +23,8 @@ The Arduino Due CAN pins are controller-level pins. Each CAN bus needs a 3.3 V-c
 | BMS CAN TX | `D53` / `CAN1TX` | JK BMS CAN transceiver `TXD` |
 | BRemote telemetry TX | `D18` / `TX1` | BRemote RX `U1-0 RX` |
 | BRemote telemetry RX | `D19` / `RX1` | BRemote RX `U1-0 TX`, optional |
+| ELRS CRSF TX | `D16` / `TX2` | ELRS receiver `RX`, future telemetry |
+| ELRS CRSF RX | `D17` / `RX2` | ELRS receiver `TX`, control data |
 | Ground | `GND` | Common logic ground |
 
 ## CAN Wiring
@@ -63,5 +65,6 @@ The JK BMS protocol uses a fixed `250 kbps` bus and little-endian payloads. The 
 - CAN0 is configured for the VESC bus at `500 kbps`.
 - CAN1 is configured for the JK BMS bus at `250 kbps`.
 - `Serial1` sends battery telemetry to the BRemote RX at `115200 baud`.
-- VESC motor commands are disabled until the DXS/BRemote input migration and failsafe logic are added for the Due.
-
+- `Serial2` decodes 16 ELRS CRSF channels at `420000 baud`.
+- The serial monitor prints every channel so transmitter controls and switches can be mapped.
+- VESC motor commands remain disabled until the ELRS/BRemote source selection and failsafe logic are verified.
