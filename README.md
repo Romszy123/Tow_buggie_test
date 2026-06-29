@@ -10,7 +10,7 @@ This repository contains two tow buggie controller variants. Each variant is pro
 | Controller variant | Arduino IDE folder | PlatformIO folder |
 |---|---|---|
 | Arduino Mega, Spektrum SRXL2 and BRemote PWM router | `Arduino_tow_buggie_spektrum_pwm` | `PlatformIO_tow_buggie_spektrum_pwm` |
-| Arduino Due, ELRS/CRSF, VESC CAN and JK BMS CAN | `Arduino_tow_buggie_due_can_elrs` | `PlatformIO_tow_buggie_due_can_elrs` |
+| Arduino Due, ELRS/CRSF, dual VESC UART, JK BMS CAN and SD logging | `Arduino_tow_buggie_due_can_elrs_logging` | `PlatformIO_tow_buggie_due_can_elrs_logging` |
 
 The Arduino IDE and PlatformIO folders in each row contain equivalent firmware. Normally you edit and flash from one version rather than editing both independently.
 
@@ -18,7 +18,7 @@ Each folder has its own README with the relevant behavior, pinout, wiring, depen
 
 ## Git Branches
 
-- `master`: current default project version, including the Due CAN/ELRS controller and reorganized project names.
+- `master`: current default project version, including the Due UART/CAN/ELRS controller and reorganized project names.
 - `feature/elrs-crsf-due`: retained branch reference to the ELRS development work; it currently points to the same reorganization commit as `master`.
 
 Switching branches changes the files visible in this working folder. Git keeps the committed versions and branch history in the hidden `.git` directory.
