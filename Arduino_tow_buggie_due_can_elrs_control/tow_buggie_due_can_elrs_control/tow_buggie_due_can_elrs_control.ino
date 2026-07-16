@@ -7,8 +7,8 @@
 #error "This sketch targets the Arduino Due / SAM3X8E."
 #endif
 
-// First bring-up build: leave motor commands disabled until VESC input
-// configuration, wiring, channel mapping, and failsafe behavior are tested.
+// Final bench gate: the ELRS control path is implemented below, but motor
+// packets remain disabled until channel directions and failsafe are verified.
 const bool ENABLE_VESC_COMMANDS = false;
 
 // Flipsky UART Protocol V1.0: 115200 baud, 8 data bits, no parity, 1 stop bit.
@@ -18,7 +18,8 @@ const bool ENABLE_VESC_COMMANDS = false;
 const uint32_t VESC_UART_BAUD = 115200;
 const uint32_t VESC_UART_TELEMETRY_PERIOD_MS = 500;
 const uint8_t VESC_UART_MAX_PAYLOAD = 96;
-const float VESC_UART_MAX_DUTY = 1.0f;
+// Conservative bring-up ceiling. Raise only after unloaded and in-water tests.
+const float VESC_UART_MAX_DUTY = 0.20f;
 const uint32_t VESC_UART_PACKET_TIMEOUT_MS = 100;
 
 // microSD module on the Due SPI header. Only chip select uses a digital pin.
@@ -47,12 +48,19 @@ const uint32_t BMS_STALE_MS = 1500;
 const uint32_t VESC_STALE_MS = 1500;
 const uint32_t ELRS_BAUD = 420000;
 const uint32_t ELRS_STALE_MS = 250;
+const uint32_t ELRS_LINK_STATS_STALE_MS = 500;
+const uint16_t ELRS_CHANNEL_MIN_US = 988;
+const uint16_t ELRS_CHANNEL_MAX_US = 2012;
+const uint16_t ELRS_THROTTLE_IDLE_US = 1050;
+const uint16_t ELRS_STEERING_CENTER_US = 1500;
+const uint16_t ELRS_STEERING_DEADBAND_US = 40;
+const uint16_t ELRS_TAKEOVER_ENABLE_US = 1700;
 
 // CRSF channel assignments are intentionally easy to change after the
 // transmitter mapping is identified from the serial monitor.
 const uint8_t ELRS_THROTTLE_CHANNEL = 1;
 const uint8_t ELRS_STEERING_CHANNEL = 2;
-const uint8_t ELRS_SOURCE_SELECT_CHANNEL = 5;
+const uint8_t ELRS_TAKEOVER_CHANNEL = 5;
 
 const uint8_t CRSF_FRAMETYPE_LINK_STATISTICS = 0x14;
 const uint8_t CRSF_FRAMETYPE_RC_CHANNELS_PACKED = 0x16;
@@ -83,16 +91,18 @@ struct BmsStatus {
   float packVoltageV = 0.0f;
   float packCurrentA = 0.0f;
   uint8_t socPercent = 0;
-  int8_t maxTempC = 0;
-  int8_t minTempC = 0;
-  int8_t avgTempC = 0;
+  int16_t maxTempC = 0;
+  int16_t minTempC = 0;
+  int16_t avgTempC = 0;
   uint8_t maxAlarmLevel = 0;
   uint32_t faultBits = 0;
 };
 
 struct ElrsStatus {
   bool seenChannels = false;
+  bool seenLinkStatistics = false;
   uint32_t lastChannelsMs = 0;
+  uint32_t lastLinkStatisticsMs = 0;
   uint32_t validFrames = 0;
   uint32_t crcErrors = 0;
   uint16_t channelRaw[CRSF_CHANNEL_COUNT] = {0};
@@ -113,6 +123,7 @@ uint32_t lastPrintMs = 0;
 uint32_t lastBremoteTelemetryMs = 0;
 float lastVescLeftCommand = 0.0f;
 float lastVescRightCommand = 0.0f;
+bool elrsArmed = false;
 
 enum VescUartRxState : uint8_t {
   VESC_UART_WAIT_START,
@@ -259,6 +270,8 @@ static void processCrsfFrame() {
     elrs.uplinkLinkQuality = payload[2];
     elrs.uplinkSnr = (int8_t)payload[3];
     elrs.activeAntenna = payload[4];
+    elrs.seenLinkStatistics = true;
+    elrs.lastLinkStatisticsMs = millis();
   }
 }
 
@@ -311,12 +324,55 @@ static bool elrsFresh() {
   return elrs.seenChannels && (millis() - elrs.lastChannelsMs <= ELRS_STALE_MS);
 }
 
+static bool elrsLinkHealthy() {
+  return elrsFresh() &&
+         elrs.seenLinkStatistics &&
+         (millis() - elrs.lastLinkStatisticsMs <= ELRS_LINK_STATS_STALE_MS) &&
+         elrs.uplinkLinkQuality > 0;
+}
+
 static uint16_t elrsChannelUs(uint8_t oneBasedChannel) {
   if (oneBasedChannel < 1 || oneBasedChannel > CRSF_CHANNEL_COUNT) {
     return 1500;
   }
   return elrs.channelUs[oneBasedChannel - 1];
 }
+
+static int16_t throttlePermille(uint16_t channelUs) {
+  if (channelUs <= ELRS_THROTTLE_IDLE_US) {
+    return 0;
+  }
+  int32_t value = map(channelUs, ELRS_THROTTLE_IDLE_US, ELRS_CHANNEL_MAX_US, 0, 1000);
+  return (int16_t)constrain(value, 0L, 1000L);
+}
+
+static int16_t steeringPermille(uint16_t channelUs) {
+  int32_t offset = (int32_t)channelUs - ELRS_STEERING_CENTER_US;
+  if (abs(offset) <= ELRS_STEERING_DEADBAND_US) {
+    return 0;
+  }
+  if (offset > 0) {
+    int32_t value = map(offset, ELRS_STEERING_DEADBAND_US,
+                        ELRS_CHANNEL_MAX_US - ELRS_STEERING_CENTER_US, 0, 1000);
+    return (int16_t)constrain(value, 0L, 1000L);
+  }
+  int32_t value = map(-offset, ELRS_STEERING_DEADBAND_US,
+                      ELRS_STEERING_CENTER_US - ELRS_CHANNEL_MIN_US, 0, 1000);
+  return (int16_t)-constrain(value, 0L, 1000L);
+}
+
+static constexpr int16_t mixLeftPermille(int16_t throttle, int16_t steering) {
+  return steering > 0 ? (int16_t)((int32_t)throttle * (1000 - steering) / 1000) : throttle;
+}
+
+static constexpr int16_t mixRightPermille(int16_t throttle, int16_t steering) {
+  return steering < 0 ? (int16_t)((int32_t)throttle * (1000 + steering) / 1000) : throttle;
+}
+
+static_assert(mixLeftPermille(1000, 1000) == 0 && mixRightPermille(1000, 1000) == 1000,
+              "Full-right differential mix failed");
+static_assert(mixLeftPermille(1000, -1000) == 1000 && mixRightPermille(1000, -1000) == 0,
+              "Full-left differential mix failed");
 
 static void sendVescUartPayload(VescUartEndpoint &endpoint,
                                 const uint8_t *payload,
@@ -479,9 +535,9 @@ static void processBmsFrame(const CAN_FRAME &frame) {
     bms.seen = true;
     bms.lastBattMs = now;
   } else if (!frame.extended && id == JK_CELL_TEMP_ID && frame.length >= 5) {
-    bms.maxTempC = (int8_t)frame.data.bytes[0] - 50;
-    bms.minTempC = (int8_t)frame.data.bytes[2] - 50;
-    bms.avgTempC = (int8_t)frame.data.bytes[4] - 50;
+    bms.maxTempC = (int16_t)frame.data.bytes[0] - 50;
+    bms.minTempC = (int16_t)frame.data.bytes[2] - 50;
+    bms.avgTempC = (int16_t)frame.data.bytes[4] - 50;
     bms.lastTempMs = now;
   } else if (!frame.extended && id == JK_ALM_INFO_ID && frame.length >= 4) {
     uint32_t alarms = readU32LE(&frame.data.bytes[0]);
@@ -503,6 +559,10 @@ static void pollCan() {
 
 static bool bmsFresh() {
   return bms.seen && (millis() - bms.lastBattMs <= BMS_STALE_MS);
+}
+
+static bool bmsTemperatureFresh() {
+  return bms.lastTempMs != 0 && (millis() - bms.lastTempMs <= BMS_STALE_MS);
 }
 
 static uint32_t dataAgeMs(bool seen, uint32_t lastMs, uint32_t now) {
@@ -678,19 +738,22 @@ static void sendBremoteTelemetry() {
   // Packet format for a matching BRemote RX parser:
   // A5 5A, version, flags, pack_mV u16, pack_current_dA i16, SOC u8,
   // avg_temp_C i8, alarm_level u8, crc16-ccitt little-endian.
+  // flags: bit0 = pack data fresh, bit1 = temperature data fresh.
   uint8_t packet[13] = {0};
   packet[0] = 0xA5;
   packet[1] = 0x5A;
   packet[2] = 1;
   const bool fresh = bmsFresh();
-  packet[3] = fresh ? 0x01 : 0x00;
+  const bool temperatureFresh = bmsTemperatureFresh();
+  packet[3] = (fresh ? 0x01 : 0x00) | (temperatureFresh ? 0x02 : 0x00);
 
   uint16_t packMv = fresh ? (uint16_t)constrain((int)(bms.packVoltageV * 1000.0f), 0, 65535) : 0;
   int16_t packCurrentDa = fresh ? (int16_t)constrain((int)(bms.packCurrentA * 10.0f), -32768, 32767) : 0;
   writeU16LE(&packet[4], packMv);
   writeU16LE(&packet[6], (uint16_t)packCurrentDa);
   packet[8] = fresh ? bms.socPercent : 0xFF;
-  packet[9] = fresh ? (uint8_t)bms.avgTempC : 0x80;
+  int16_t avgTempC = constrain(bms.avgTempC, (int16_t)-127, (int16_t)127);
+  packet[9] = temperatureFresh ? (uint8_t)(int8_t)avgTempC : 0x80;
   packet[10] = bms.maxAlarmLevel;
 
   uint16_t crc = crc16Ccitt(packet, 11);
@@ -698,18 +761,36 @@ static void sendBremoteTelemetry() {
   Serial1.write(packet, sizeof(packet));
 }
 
-static void sendSafeVescCommands() {
+static void sendElrsVescCommands() {
   if (!ENABLE_VESC_COMMANDS) {
-    // Do not transmit motor control packets until explicitly enabled.
+    elrsArmed = false;
     lastVescLeftCommand = 0.0f;
     lastVescRightCommand = 0.0f;
     return;
   }
 
-  // Keep zero commands during receiver bring-up. Once channel assignments and
-  // failsafe behavior are verified, map ELRS throttle/steering and the BRemote
-  // fallback into these two normalized forward commands.
-  setVescOutputs(0.0f, 0.0f);
+  const uint16_t throttleUs = elrsChannelUs(ELRS_THROTTLE_CHANNEL);
+  const bool takeoverSelected = elrsChannelUs(ELRS_TAKEOVER_CHANNEL) >= ELRS_TAKEOVER_ENABLE_US;
+  if (!elrsLinkHealthy() || !takeoverSelected) {
+    elrsArmed = false;
+    setVescOutputs(0.0f, 0.0f);
+    return;
+  }
+
+  // A newly selected/reconnected ELRS link must first be seen at idle.
+  if (!elrsArmed) {
+    if (throttleUs > ELRS_THROTTLE_IDLE_US) {
+      setVescOutputs(0.0f, 0.0f);
+      return;
+    }
+    elrsArmed = true;
+  }
+
+  const int16_t throttle = throttlePermille(throttleUs);
+  const int16_t steering = steeringPermille(elrsChannelUs(ELRS_STEERING_CHANNEL));
+  const int16_t left = mixLeftPermille(throttle, steering);
+  const int16_t right = mixRightPermille(throttle, steering);
+  setVescOutputs((float)left / 1000.0f, (float)right / 1000.0f);
 }
 
 static void printOneVesc(const char *label, const VescStatus &status) {
@@ -745,7 +826,7 @@ static void printStatus() {
     SerialUSB.print("/");
     SerialUSB.print(elrsChannelUs(ELRS_STEERING_CHANNEL));
     SerialUSB.print("/");
-    SerialUSB.print(elrsChannelUs(ELRS_SOURCE_SELECT_CHANNEL));
+    SerialUSB.print(elrsChannelUs(ELRS_TAKEOVER_CHANNEL));
     SerialUSB.print("us");
   } else {
     SerialUSB.print(elrs.seenChannels ? "stale" : "waiting");
@@ -754,6 +835,8 @@ static void printStatus() {
   SerialUSB.print(elrs.validFrames);
   SerialUSB.print(" crcErr=");
   SerialUSB.print(elrs.crcErrors);
+  SerialUSB.print(" control=");
+  SerialUSB.print(!ENABLE_VESC_COMMANDS ? "disabled" : (elrsArmed ? "armed" : "disarmed"));
   SerialUSB.println();
 
   if (elrs.seenChannels) {
@@ -816,7 +899,18 @@ void setup() {
   vescRightUart.port = &Serial3;
   vescRightUart.status = &vescRight;
 
-  Can1.begin(JK_BMS_CAN_BAUD);
+  uint32_t canStartResult = Can1.begin(JK_BMS_CAN_BAUD);
+  bool canFiltersReady = true;
+  canFiltersReady &= Can1.watchFor(JK_BATT_ST1_ID) >= 0;
+  canFiltersReady &= Can1.watchFor(JK_CELL_TEMP_ID) >= 0;
+  canFiltersReady &= Can1.watchFor(JK_ALM_INFO_ID) >= 0;
+  canFiltersReady &= Can1.watchFor(JK_BMSERR_INFO_ID) >= 0;
+  if (canStartResult == 0) {
+    SerialUSB.println("Warning: CAN1 did not synchronize during startup.");
+  }
+  if (!canFiltersReady) {
+    SerialUSB.println("Warning: one or more JK BMS CAN filters could not be installed.");
+  }
   initSdLogging();
 
   SerialUSB.println("Tow Buggie Due dual VESC UART + BMS CAN + ELRS CRSF bring-up.");
@@ -825,6 +919,7 @@ void setup() {
   SerialUSB.println("Diagnostics: Native USB / SerialUSB.");
   SerialUSB.println("SD commands: E=flush/eject, R=reinitialize after reinserting.");
   SerialUSB.println("ELRS wiring: receiver TX -> D17/RX2, receiver RX -> D16/TX2.");
+  SerialUSB.println("ELRS map: CH1 throttle, CH2 steering, CH5 takeover/arm; reconnect at idle.");
   SerialUSB.println(ENABLE_VESC_COMMANDS ? "VESC commands enabled." : "VESC commands disabled for safe bring-up.");
 }
 
@@ -838,7 +933,7 @@ void loop() {
 
   if (now - lastVescCommandMs >= VESC_COMMAND_PERIOD_MS) {
     lastVescCommandMs = now;
-    sendSafeVescCommands();
+    sendElrsVescCommands();
   }
 
   if (now - lastVescUartTelemetryMs >= VESC_UART_TELEMETRY_PERIOD_MS) {

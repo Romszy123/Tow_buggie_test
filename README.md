@@ -10,7 +10,7 @@ This repository contains two tow buggie controller variants. Each variant is pro
 | Controller variant | Arduino IDE folder | PlatformIO folder |
 |---|---|---|
 | Arduino Mega, Spektrum SRXL2 and BRemote PWM router | `Arduino_tow_buggie_spektrum_pwm` | `PlatformIO_tow_buggie_spektrum_pwm` |
-| Arduino Due, ELRS/CRSF, dual VESC UART, JK BMS CAN and SD logging | `Arduino_tow_buggie_due_can_elrs_logging` | `PlatformIO_tow_buggie_due_can_elrs_logging` |
+| Arduino Due, ELRS/CRSF control, dual VESC UART, JK BMS CAN and SD logging | `Arduino_tow_buggie_due_can_elrs_control` | `PlatformIO_tow_buggie_due_can_elrs_control` |
 
 The Arduino IDE and PlatformIO folders in each row contain equivalent firmware. Normally you edit and flash from one version rather than editing both independently.
 
